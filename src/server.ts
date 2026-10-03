@@ -5375,12 +5375,15 @@ async function preflightCompressIfNeeded(
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
-    // raw history. Judging that on the optimistic chars/4 estimate undercounts
-    // code/JSON replays by up to ~4x, so an over-window payload triggers
-    // nothing and is forwarded raw (upstream 400 / long-prefill timeout). Judge
-    // exactly those sessions by the char-count upper bound (never undershoots;
-    // the image/wire floors still apply — #488/#470 postdate the fork).
-    // Sessions with a client-provided identity keep the optimistic path: their
+    // raw history. Such a session has no usage baseline at all, so every size
+    // judgment here and inside preflight runs on the local CJK-aware estimate
+    // (estimateCoreMessages) — one honest scale, whose disagreement with the
+    // rebuilt payload is resolved by forwarding once (#1839) instead of failing
+    // fast. #553-fix: this used to be the char-count upper bound, which counts
+    // ASCII bytes as tokens (~3-4x inflation on code/JSON replays), armed
+    // preflight on payloads that fitted, and then could never fold the bound
+    // below the window → 502 "compress budget exhausted" on healthy sessions.
+    // Sessions with a client-provided identity keep the measured path: their
     // 0-baseline means a genuinely new conversation or a post-native-compaction
     // replay, both small enough to self-heal via the learned-window path.
     const unknownBaseline = anonymous && session.stats.lastInputTokens <= 0;
@@ -5423,9 +5426,7 @@ async function preflightCompressIfNeeded(
     const kOrigin = session.stats.calibratedEstimateOrigin;
     const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
     const calibratedPayload = calibratedText + imageTokens;
-    const tokenCount = unknownBaseline
-        ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
-        : Math.max(baselineFloor, calibratedPayload);
+    const tokenCount = Math.max(baselineFloor, calibratedPayload);
     // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
     // text vs `target − imageReserve`. Exact algebraic rewrite of the old
     // total-view trigger: subtracting the constant reserve from both sides of
@@ -5436,14 +5437,12 @@ async function preflightCompressIfNeeded(
     // can MOVE the decision: an image-estimate error (±15x on non-pixel-tile
     // upstreams, #1800) can no longer arm preflight over a text payload that
     // fits, nor keep it armed after the text has been folded down.
-    const textChannel = unknownBaseline
-        ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate
-        : calibratedText;
+    const textChannel = calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
     if (limit <= 0 || !model || !triggerFires) return prepared;
-    const payloadFitsWindow = (unknownBaseline ? tokenCount : calibratedPayload) < limit;
+    const payloadFitsWindow = calibratedPayload < limit;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -5522,7 +5521,9 @@ async function preflightCompressIfNeeded(
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
-        // Anonymous sessions need the conservative upper bound to prove that fit.
+        // Delivery is decided by the payload's own (calibrated) estimate for both
+        // regimes since #553-fix — the anonymous char-count bound that used to
+        // gate this line is gone, so a fit here is a real fit.
         if (payloadFitsWindow) {
             log("info", `[${session.id}] preflight target reached (~${tokenCount}) but the payload fits with no compressible ranges (~${Math.round(calibratedPayload)}/${limit}${kFactor !== undefined ? `, k̂=${kFactor.toFixed(2)}` : ""}); forwarding as-is`);
             return prepared;
@@ -5637,9 +5638,7 @@ async function preflightCompressIfNeeded(
         outbound = rebuilt;
         // Same calibrated caliber as the trigger above — gate, per-round exit
         // and this final fit must judge the payload on one scale (#1933 F1).
-        const fits = unknownBaseline
-            ? result.fitsWindow
-            : applyEstimateCalibration(estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
+        const fits = applyEstimateCalibration(estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         if (fits) return rebuilt;
         // #1839: the two measurements disagree — preflight's own final view
         // (post-fold content + images + wire overhead) fits, but the fresh
@@ -5650,13 +5649,11 @@ async function preflightCompressIfNeeded(
         // and armOverflowShrink recovers with real evidence; a fitting
         // payload is no longer refused on a stale measurement. One forward
         // only — the #330 relaxed-zone caveat still bounds the risk.
-        if (!unknownBaseline && result.failure?.kind !== "aborted" && result.payloadEstimate < limit) {
+        if (result.failure?.kind !== "aborted" && result.payloadEstimate < limit) {
             log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
             return rebuilt;
         }
-    } else if (unknownBaseline
-        ? result.fitsWindow
-        : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
+    } else if (estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }

@@ -95,13 +95,14 @@ export interface PreflightDeps {
     imageReserve?: number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
-    /** #553: the caller knows this session's input size is unmeasured AND its
-     *  raw history is untrusted (anonymous prefix-affinity session with
-     *  lastInputTokens == 0 — a fork minted when an ACP compression broke the
-     *  chain hash). Size judgments then use the char-count upper bound
-     *  (estimateCoreMessagesUpper / char-based chunking) instead of the
-     *  optimistic chars/4 estimator, which undercounts code/JSON replays by up
-     *  to ~4x and would let an over-window payload slip through uncompressed. */
+    /** #553: the caller knows this session's input size is unmeasured (anonymous
+     *  prefix-affinity session with lastInputTokens == 0 — a fork minted when an
+     *  ACP compression broke the chain hash). The whole loop then runs without a
+     *  usage baseline: sizes come from the local CJK-aware estimate, the #330
+     *  soft-zone relax gate reads the payload's own estimate, and the caller
+     *  forwards once on disagreement (#1839). Judgment stays on that one honest
+     *  scale — an inflated upper bound here cannot be folded below the window,
+     *  so it only produced 502s on payloads that fit (#553-fix). */
     unknownBaseline?: boolean;
     /** #1933 F1: origin of the upstream this request routes to. When it matches the route that learned the session's estimate-calibration factor k̂, every per-round text estimate is scaled by k̂ so gate, per-round exit and final fit judge one payload on the same scale as the trigger that started this invocation; absent or mismatched → raw estimates (legacy behavior). */
     upstreamOrigin?: string;
@@ -141,11 +142,12 @@ export interface PreflightResult {
      *  (#869 review). */
     rangesRemaining: number;
     /** Whether the final payload fits the window, judged with the same
-     *  measure the loop used: the optimistic token estimate for
-     *  measured-baseline sessions (#300 — a stale HIGH baseline must not
-     *  fail-fast a fitting payload), the char-count upper bound for
-     *  unknown-baseline ones (#553 — the optimistic figure can undershoot by
-     *  up to ~4x on dense replays, so only the upper bound proves a fit). */
+     *  measure the loop used: the calibrated local token estimate
+     *  (#300/#1933 F1 — a stale HIGH baseline must not fail-fast a fitting
+     *  payload, and the trigger's caliber is what per-round exit and this
+     *  verdict share). #553-fix: this single scale now applies to
+     *  unknown-baseline sessions too; their old char-count upper bound could
+     *  not be folded below a token window and failed payloads that fit. */
     fitsWindow: boolean;
     /** Why the loop stopped while the payload still overflows the window.
      *  Undefined when the payload fits. */
@@ -208,13 +210,13 @@ export function estimateRawBodyTokens(parsed: unknown): number {
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts
-// as one token. A BPE token covers >=1 char (Latin/code) and CJK is already
-// ~1 token/char, so this never undershoots the real count, unlike
-// defaultCountTokens' 4-chars-per-token for non-CJK. Used only for anonymous
-// prefix-affinity sessions without a measured baseline (a fork mints a new
-// session id with lastInputTokens == 0 after an ACP compression breaks the
-// chain hash), where an undershoot lets an over-window payload slip past the
-// trigger and the fit checks and get forwarded raw.
+// as one token, so it never undershoots (a BPE token covers >=1 char for
+// Latin/code and CJK is already ~1 token/char). Since #553-fix this is NOT a
+// size-judgment quantity any more — char counts judged against a token window
+// inflate ASCII ~3-4x and armed preflight on payloads that fit. Its one
+// remaining caller is the caller's FAILURE-shrink arm (server.ts armEstimate),
+// where an over-estimate is the safe direction: the armed value only gates how
+// deep the truncation loop may go.
 export function estimateCoreMessagesUpper(messages: CoreMessage[]): number {
     let chars = 0;
     for (const m of messages) chars += (m.text ?? "").length;
@@ -863,15 +865,20 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
     // compression broke prefix affinity, #553) starts at 0 while still
     // carrying a full raw history that may overflow the window.
-    // #553: for an unknown-baseline session the optimistic chars/4 estimate can
-    // be off by up to ~4x on code/JSON replays, so judge those by the char-count
-    // upper bound (never undershoots). The regime is caller-decided and fixed
-    // for the whole loop — lastInputTokens mutates mid-loop and must not flip it.
+    // #553-fix: an unmeasured-baseline session is judged by the same CJK-aware
+    // estimator as the measured path. The char-count upper bound this used to
+    // run (estimateCoreMessagesUpper) counted ASCII bytes as tokens — ~3-4x
+    // inflation on code/JSON replays — which armed preflight over payloads that
+    // fit and then never converged: a char bound can't be folded below a token
+    // window. Overshoot beyond this estimate is still caught upstream (a real
+    // rejection arms the overflow baseline, and the #1839 escape forwards once).
+    // The regime is caller-decided and fixed for the whole loop — lastInputTokens
+    // mutates mid-loop and must not flip it.
     const baselineKnown = deps.unknownBaseline !== true;
-    const countText = baselineKnown ? defaultCountTokens : (text: string): number => text.length;
-    let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessagesUpper(messages);
+    const countText = defaultCountTokens;
+    let currentTokens = baselineKnown ? deps.session.stats.lastInputTokens : estimateCoreMessages(messages) + imageReserve + wireOverhead;
     let decisionTokens = 0;
-    let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
+    let finalUpper = baselineKnown ? 0 : estimateCoreMessages(messages) + imageReserve + wireOverhead;
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
     let lastUnusableDetail: string | undefined;
@@ -903,7 +910,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // note atop the file). A raised budget is only a ceiling — well-behaved
     // payloads exit early exactly as before; only genuinely huge payloads burn
     // toward it before the fail-fast reports how far it ran out.
-    const entryLocal = (baselineKnown ? estimateCoreMessages(messages) : estimateCoreMessagesUpper(messages)) + imageReserve + wireOverhead;
+    const entryLocal = estimateCoreMessages(messages) + imageReserve + wireOverhead;
     const entryTokens = Math.max(baselineKnown ? deps.session.stats.lastInputTokens : 0, entryLocal);
     const overshootRatio = limit > 0 && entryTokens > 0 ? entryTokens / limit : 1;
     const summaryBudget = Math.min(MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, Math.max(MAX_SUMMARY_CALLS_PER_PREFLIGHT, Math.ceil(MAX_SUMMARY_CALLS_PER_PREFLIGHT * overshootRatio)));
@@ -959,12 +966,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // the reserve (floored at zero).
         decisionTokens = Math.max(Math.max(0, baselineFloor - imageReserve), roundText);
         if (!baselineKnown) {
-            // #558-merge: the upper-bound regime also carries the image/wire
-            // floors — they are real billed costs the fold can never remove
-            // (#470/#488 postdate this PR's fork point).
-            finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
+            // #558-merge: the unmeasured-baseline regime also carries the
+            // image/wire floors — they are real billed costs the fold can never
+            // remove (#470/#488 postdate this PR's fork point). Deliberately the
+            // RAW text estimate (not the calibrated one): kFactor is learned from
+            // usage reports, and an unmeasured session has none yet.
+            finalUpper = estimateCoreMessages(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
-            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
+            decisionTokens = Math.max(decisionTokens, estimateCoreMessages(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
@@ -1038,16 +1047,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 continue;
             }
             rangesTried += 1;
-            // minUnits only in the char regime: with the optimistic token budget a
-            // sub-minimum chunk is already rare, and keeping minUnits = 0 there
-            // preserves the historical packing exactly.
+            // #553-fix: both regimes count tokens now, so no char-regime minUnits.
+            // With the token budget a sub-minimum chunk is already rare, and
+            // minUnits = 0 preserves the historical packing of the measured path.
             // #726: spans form a worklist instead of a flat pass. A chunk whose
             // summary comes back unusable is halved (oldest half first) and
             // retried down to a floor before the whole range is given up: the
             // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
             // exceeding the upstream's real input cap, and halving recovers
             // exactly those cases. Bounded by the per-regime call budget below.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, 0, countText).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
@@ -1206,7 +1215,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (summary === null) {
                     const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
                     if (outcome) lastUnusableDetail = unusableDetail;
-                    const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                    const floorUnits = 2 * MIN_CHUNK_TOKENS;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
                         const mid = Math.floor((cs + ce) / 2);
@@ -1235,11 +1244,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     break;
                 }
                 // The summary itself re-enters the payload; net its cost against
-                // both the folded size and the session's input baseline. Without a
-                // baseline currentTokens is char-based, so net the folded span's
-                // char count against it instead of the token-based credit.
+                // both the folded size and the session's input baseline. Both
+                // regimes now net TOKENS (#553-fix) — the folded span's char
+                // count only balanced a char-based currentTokens.
                 const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                const folded = baselineKnown ? compressed : estimateCoreMessages(messages.filter((message) => planned.effectiveMessageIds.includes(message.id)));
                 currentTokens = Math.max(0, currentTokens - folded + countText(summary));
                 deps.session.stats.lastInputTokens += defaultCountTokens(summary);
                 appliedThisRound += 1;
@@ -1302,6 +1311,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
-    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    result.fitsWindow = result.payloadEstimate < limit;
     return result;
 }
