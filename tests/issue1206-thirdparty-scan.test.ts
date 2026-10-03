@@ -42,8 +42,11 @@ function writeFile(file: string, content: string): void {
     fs.writeFileSync(file, content);
 }
 
-// Hermetic env: every client home resolves under root, nothing leaks to the
-// developer's real home directories.
+// Hermetic env for XDG-resolving clients (opencode). The pi/omp/kimi/hermes
+// resolvers derive their base from os.homedir(), NOT env.HOME, so a caller
+// touching those homes MUST add the client-specific override (PI_HOME /
+// PI_CODING_AGENT_DIR / *_HOME) — a bare hermeticEnv() fixture write once
+// landed in the real ~/.pi/agent/settings.json and ~/.omp/agent/config.yml.
 function hermeticEnv(root: string): NodeJS.ProcessEnv {
     return { HOME: root, XDG_CONFIG_HOME: path.join(root, ".config") };
 }
@@ -143,11 +146,12 @@ test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili
     clearScanCache();
     const root = tmp("bili-1206-pi-");
     const cwd = tmp("bili-1206-pi-cwd-");
-    const home = resolvePiHome(hermeticEnv(root));
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_HOME: path.join(root, "pi-agent") };
+    const home = resolvePiHome(env);
     writeFile(path.join(home, "settings.json"), JSON.stringify({
         packages: ["npm:billion-context-pi", "npm:context-compactor", "npm:context-forge", "/u/node_modules/billion-context/dist/agent/pi.js"],
     }));
-    const res = scanClientPlugins("pi", { env: hermeticEnv(root), cwd });
+    const res = scanClientPlugins("pi", { env, cwd });
     const bcp = res.findings.find((f) => f.entry === "npm:billion-context-pi");
     assert.equal(bcp?.match, "known");
     assert.equal(bcp?.knownId, "billion-context-pi");
@@ -159,7 +163,8 @@ test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili
 test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", () => {
     clearScanCache();
     const root = tmp("bili-1206-omp-");
-    const home = resolveOmpHome(hermeticEnv(root));
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_CODING_AGENT_DIR: path.join(root, "omp-agent") };
+    const home = resolveOmpHome(env);
     writeFile(path.join(home, "config.yml"), [
         "model: m",
         "extensions:",
@@ -169,10 +174,19 @@ test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", (
         "providers:",
         "  default: openai",
     ].join("\n"));
-    const res = scanClientPlugins("omp", { env: hermeticEnv(root), cwd: root });
+    const res = scanClientPlugins("omp", { env, cwd: root });
     assert.equal(res.findings.length, 1, "action-token kept, bare-'context' dropped (#1736)");
     assert.equal(res.findings[0]?.entry, "npm:context-compactor");
     assert.equal(res.findings[0]?.match, "keyword");
+});
+
+test("#1206: pi/omp fixture homes stay inside the temp root", () => {
+    const root = tmp("bili-1206-iso-");
+    const pi = resolvePiHome({ ...hermeticEnv(root), PI_HOME: path.join(root, "pi-agent") });
+    const omp = resolveOmpHome({ ...hermeticEnv(root), PI_CODING_AGENT_DIR: path.join(root, "omp-agent") });
+    assert.ok(pi.startsWith(root + path.sep), `pi fixture home escaped the temp root: ${pi}`);
+    assert.ok(omp.startsWith(root + path.sep), `omp fixture home escaped the temp root: ${omp}`);
+    assert.notEqual(omp, resolveOmpHome({}), "omp fixture env must not resolve to the developer's real ~/.omp/agent");
 });
 
 test("kimi scan: installed.json ids scanned, billion-context skipped", () => {
